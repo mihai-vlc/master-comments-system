@@ -8,7 +8,7 @@
 * The intention is to make this a stand alone class so we are using ``mysqli`` to handle the mysql interactions
 * 	therefor you will need to pass your mysql details also
 * @author  Mihai Ionut Vilcu (ionutvmi@gmail.com)
-* 07-July-2013
+* July-2013
 */
 class Comments_System
 {
@@ -17,7 +17,8 @@ class Comments_System
 	 * @var array
 	 */
 	var $settings = array(
-			'table_name' => '_comments', // the name of the table in which the comments will be hold
+			'comments_table' => '_comments', // the name of the table in which the comments will be hold
+			'banned_table' => '_banned', // the name of the table in which the comments will be hold
 			'auto_install' => true, // if the class is not already installed it will attempt to install it
 			'public' => true, // if true unregistered users are allowed to post a comment
 			'optional_email' => false, // if true users don't need to enter a valid email
@@ -36,7 +37,8 @@ class Comments_System
 	var $error = false; // it will hold an error message if any
 	var $success = false; // it will hold an success message if any
 	var $tmp = false; // it will carry some temporary data
-	var	$ignore = array('comm_edit', 'comm_del', 'comm_reply', 'comm_ban'); // keep the url clean
+	var	$ignore = array('comm_edit', 'comm_del', 'comm_reply', 'comm_ban', 'comm_unban'); // keep the url clean
+	var $checked_ips = array(); // will hold the ips checked if banned or not
 
 	/**
 	 * setup the mysql connction and some settings
@@ -44,6 +46,8 @@ class Comments_System
 	 * @param array  $settings   settings to overwrite the default ones
 	 */
 	function __construct($db_details , $settings = array())  {
+		if(session_id() == '')
+			session_start();
 
 		// we first manage the mysql connection
 		$this->link = @mysqli_connect($db_details['db_host'], $db_details['db_user'], $db_details['db_pass']);
@@ -55,23 +59,37 @@ class Comments_System
 		// we add the new settings if any
 		$this->settings = array_merge($this->settings, $settings);
 
-		$this->settings['table_name'] = str_replace("`", "``", $this->settings['table_name']);
+		$this->settings['comments_table'] = str_replace("`", "``", $this->settings['comments_table']);
 
 		// auto install
-		if($this->settings['auto_install'] && !@mysqli_num_rows(mysqli_query($this->link, "SELECT `id` FROM `".$this->settings['table_name']."`")))
+		if($this->settings['auto_install'] && !@mysqli_num_rows(mysqli_query($this->link, "SELECT `id` FROM `".$this->settings['comments_table']."`")))
 			$this->install();
 
 
 		// edit comment
-		if(isset($_POST['comm_edit']) && ($comm = mysqli_query($this->link, "SELECT * FROM `".$this->settings['table_name']."` 
+		if(isset($_POST['comm_edit']) && ($comm = mysqli_query($this->link, "SELECT * FROM `".$this->settings['comments_table']."` 
 				WHERE `id`='".(int)$_POST['comm_edit']."'")))
 		{
 			// if the comment exists and the user has the rights to edit it
 			if(mysqli_num_rows($comm) && $this->hasRights(mysqli_fetch_object($comm))) {
-				$this->grabComment(1, (int)$_POST['comm_edit']);
+				$this->grabComment($_SESSION['comm_pageid'], (int)$_POST['comm_edit']);
 				$this->tmp = "edited";
 			}
 		}
+
+
+		// delete comment
+		if(isset($_POST['comm_del']))
+			if($this->delComm($_POST['comm_del']))
+				$this->success = "Comment deleted !";
+
+		// bann ip
+		if( isset($_GET['comm_ban']) && $this->banIP($_GET['comm_ban']) ) // we banned the ip
+			$this->success = "IP banned !";
+		
+		// UnBann ip
+		if( isset($_GET['comm_unban']) && $this->unBanIP($_GET['comm_unban']) )
+			$this->success = "IP UnBanned !";
 
 		return true;
 	}
@@ -81,15 +99,35 @@ class Comments_System
 	function grabComment($pageid, $update_id = false) {
 		if(session_id() == '')
 			session_start();
-		
+
+		$_SESSION['comm_pageid'] = $pageid;
 
 		// we make sure it's a valid post
 		if(isset($_POST['comm_submit']) && isset($_SESSION['comm_token']) && ($_POST['comm_token'] === $_SESSION['comm_token']) &&
 			($this->tmp != 'edited')) { // we make sure we don't handle the data again if it was an edit
 
-			$name = $_POST['comm_name'];
+			$name = isset($_POST['comm_name']) ? $_POST['comm_name'] : '';
+			$email = isset($_POST['comm_email']) ? $_POST['comm_email'] : '';
 			
-			$min = $this->settings['public'] ? 2 : 0;
+			$min = 2;
+
+			if( !$this->settings['public'] ) { // if it's not public we use the provided details
+				// if it's not public and it has $_POST[name] something is wrong
+				if(isset($_POST['comm_name'])){
+					$this->error = "Something is wrong !";
+					return false;
+				}
+
+				$min = 0;
+				$name = $this->settings['user_details']['name'];
+				$email = $this->settings['user_details']['email'];
+
+			}
+
+			if($this->isBanned($this->ip())) {
+				$this->error = "You are banned !";
+				return false;
+			}
 
 			if(!isset($name[$min])){
 				$this->error = "Invalid name !";
@@ -102,7 +140,6 @@ class Comments_System
 				return false;
 			}
 
-			$email = $_POST['comm_email'];
 
 			// we check in case the email is not valid
 			if(!$this->settings['optional_email']) 
@@ -113,20 +150,28 @@ class Comments_System
 
 
 			// we check if it's an update or a new message 
-			if($update_id && mysqli_query($this->link, "UPDATE `".$this->settings['table_name']."` SET 
-				`name` = '".mysqli_real_escape_string($this->link, $name)."',
-				`message` = '".mysqli_real_escape_string($this->link, $message)."',
-				`email` = '".mysqli_real_escape_string($this->link, $email)."'
-				WHERE `id` = '".(int)$update_id."'")) {
+			if($update_id) {
+				if( $this->settings['public'] )
+					$upd_fields = ",`name` = '".mysqli_real_escape_string($this->link, $name)."',
+									`email` = '".mysqli_real_escape_string($this->link, $email)."'";
+				else			
+					$upd_fields = '';
 
-					$this->success = "Comment edited successfully !";
-					return true;
+
+				if(mysqli_query($this->link, "UPDATE `".$this->settings['comments_table']."` SET 
+					`message` = '".mysqli_real_escape_string($this->link, $message)."'
+					$upd_fields
+					WHERE `id` = '".(int)$update_id."'")) {
+
+						$this->success = "Comment edited successfully !";
+						return true;
+				}
 			}
 
 
 			// we check if this is a valid reply
 			if(isset($_POST['comm_reply']) && 
-				mysqli_num_rows(mysqli_query($this->link, "SELECT `id` FROM `".$this->settings['table_name']."` 
+				mysqli_num_rows(mysqli_query($this->link, "SELECT `id` FROM `".$this->settings['comments_table']."` 
 					WHERE `id`= '".(int)$_POST['comm_reply']."' AND `parent`  = '0'")))					
 					$reply = ",`parent` = '".(int)$_POST['comm_reply']."'";
 				else
@@ -134,7 +179,7 @@ class Comments_System
 
 
 
-			if(mysqli_query($this->link, "INSERT INTO `".$this->settings['table_name']."` SET 
+			if(mysqli_query($this->link, "INSERT INTO `".$this->settings['comments_table']."` SET 
 				`name` = '".mysqli_real_escape_string($this->link, $name)."',
 				`message` = '".mysqli_real_escape_string($this->link, $message)."',
 				`time` = '".time()."',
@@ -159,10 +204,22 @@ class Comments_System
 		}
 	}
 
-
+	/**
+	 * Lists the comments for the inserted page id
+	 * @param  integer $pageid  
+	 * @param  integer $perpage 
+	 * @return string           the generated html code
+	 */
 	function generateComments($pageid = 0, $perpage = 10) {
+
+		if(session_id() == '')
+			session_start();
+
+		$_SESSION['comm_pageid'] = $pageid;
+
 		$html ="<ul class='media-list'>";
 
+		
 		$comments = $this->getComments($pageid, $perpage);
 		
 
@@ -192,10 +249,11 @@ class Comments_System
 				$browser = explode(" ", $comment->browser);
 				$show_extra = "($comment->email | ".$browser[0]." | $comment->ip)";
 			}
-
+			$is_del = (isset($_GET['comm_del']) && ($_GET['comm_del'] === $comment->id) && $this->hasRights($comment))
+						? " background-color: #FFDE89; border: 1px solid red;" : null;
 
 			$html .= "
-			<li class='media' id='$comment->id' style='$style'>
+			<li class='media' id='$comment->id' style='".$style.$is_del."'>
 				<a class='pull-left' href='http://gravatar.com'>
 				<img class='media-object' src='http://gravatar.com/avatar/".md5($comment->email)."'>
 				</a>
@@ -210,8 +268,12 @@ class Comments_System
 						<small class='muted'>".$this->tsince($comment->time)."</small>
 						".$this->admin_options($comment)."
 					</h4>
-					<p>".nl2br($this->html($comment->message))."</p>
-					$show_reply";
+					<p>".nl2br($this->html($comment->message))."</p>";
+
+			if($is_del)
+				$html .= $this->gennerateConfirm('', 'comm_del', $comment->id);
+			else
+				$html .= $show_reply;
 
 				$html .= $this->generateReplies($comment->id)."
 				</div>
@@ -247,10 +309,11 @@ function generateReplies($comm_id, $limit = 3) {
 				$browser = explode(" ", $comment->browser);
 				$show_extra = "($comment->email | ".$browser[0]." | $comment->ip)";
 			}
-
+			$is_del = (isset($_GET['comm_del']) && ($_GET['comm_del'] === $comment->id) && $this->hasRights($comment))
+						? " background-color: #FFDE89; border: 1px solid red;" : null;
 
 			$html .= "
-			<div class='media' id='$comment->id' style='$style'>
+			<div class='media' id='$comment->id' style='". $style. $is_del ."'>
 				<a class='pull-left' href='http://gravatar.com'>
 				<img class='media-object' src='http://gravatar.com/avatar/".md5($comment->email)."'>
 				</a>	
@@ -267,11 +330,12 @@ function generateReplies($comm_id, $limit = 3) {
 						".$this->admin_options($comment)."
 					</h4>
 					<p>".nl2br($this->html($comment->message))."</p>";
+			
+			if($is_del)
+				$html .= $this->gennerateConfirm('', 'comm_del', $comment->id);
 
+			$html .= "</div></div>";
 
-
-			$html .= "</div>
-			</div>";
 	}
 
 	return $html;
@@ -293,7 +357,27 @@ function generateReplies($comm_id, $limit = 3) {
 		else
 			$title = "Post a comment";
 
+		$show_name_email = '';
+		
+		if( $this->settings['public'] ) {
+			$show_name_email = "<div class='control-group'>
+			  <label class='control-label' for='comm_name'>Name</label>
+			  <div class='controls'>
+				<input id='comm_name' name='comm_name' type='text' class='input-xlarge' value='$comment->name'>
+				
+			  </div>
+			</div>
 
+			<div class='control-group'>
+			  <label class='control-label' for='comm_email'>Email</label>
+			  <div class='controls'>
+				<input id='comm_email' name='comm_email' type='text' class='input-xlarge' value='$comment->email'>
+			  	<p>
+			  	".($this->settings['optional_email'] ? "(optional, it will not be public.)" : "")."
+			  	</p>
+			  </div>
+			</div>";
+		}
 
 
 		$html = "
@@ -301,23 +385,7 @@ function generateReplies($comm_id, $limit = 3) {
 		<fieldset>
 		<legend>$title</legend>
 
-		<div class='control-group'>
-		  <label class='control-label' for='comm_name'>Name</label>
-		  <div class='controls'>
-			<input id='comm_name' name='comm_name' type='text' class='input-xlarge' value='$comment->name'>
-			
-		  </div>
-		</div>
-
-		<div class='control-group'>
-		  <label class='control-label' for='comm_email'>Email</label>
-		  <div class='controls'>
-			<input id='comm_email' name='comm_email' type='text' class='input-xlarge' value='$comment->email'>
-		  	<p>
-		  	".($this->settings['optional_email'] ? "(optional, it will not be public.)" : "")."
-		  	</p>
-		  </div>
-		</div>
+		$show_name_email
 
 		<div class='control-group'>
 		  <label class='control-label' for='comm_msg'>Message</label>
@@ -347,7 +415,7 @@ function generateReplies($comm_id, $limit = 3) {
 	 */
 	function install() {
 
-		$sql = "CREATE TABLE IF NOT EXISTS `".$this->settings['table_name']."` (
+		$sql = "CREATE TABLE IF NOT EXISTS `".$this->settings['comments_table']."` (
 		  `id` int(11) NOT NULL AUTO_INCREMENT,
 		  `name` varchar(255) NOT NULL,
 		  `message` text NOT NULL,
@@ -361,8 +429,12 @@ function generateReplies($comm_id, $limit = 3) {
 		  PRIMARY KEY (`id`)
 		);";
 
+		$sql2 = "CREATE TABLE IF NOT EXISTS `_banned` (
+		  `ip` varchar(255) NOT NULL,
+		  UNIQUE KEY `ip` (`ip`)
+		);";
 
-		if(mysqli_query($this->link, $sql))
+		if(mysqli_query($this->link, $sql) && mysqli_query($this->link, $sql2))
 			return true;
 
 		return false;
@@ -377,7 +449,7 @@ function generateReplies($comm_id, $limit = 3) {
 	function getComments($pageid = 0, $perpage = 10) {
 		$comments = array();
 
-		$sql = "SELECT * FROM `".$this->settings['table_name']."` WHERE `parent` = 0 ";
+		$sql = "SELECT * FROM `".$this->settings['comments_table']."` WHERE `parent` = 0 ";
 
 		if($pageid)
 			$sql .= "AND `pageid` = '".mysqli_real_escape_string($this->link, $pageid)."'";
@@ -415,7 +487,7 @@ function generateReplies($comm_id, $limit = 3) {
 	function getReplies($comm_id = 0, $limit = 3) {
 		$comments = array();
 
-		$sql = "SELECT * FROM `".$this->settings['table_name']."` 
+		$sql = "SELECT * FROM `".$this->settings['comments_table']."` 
 			WHERE `parent` = '".mysqli_real_escape_string($this->link, $comm_id)."'";
 
 		// limitation
@@ -587,17 +659,16 @@ function generateReplies($comm_id, $limit = 3) {
 	 * generates a confirmation form
 	 * @return string the html code of the form
 	 */
-	function gennerateConfirm($location = '', $info = false) {
+	function gennerateConfirm($location = '', $info_name = 'comm_del', $info_value = 0, $submit = "I&#39;m sure, Delete") {
 
 		if($location == '')
 			$location = "?".$this->queryString('', $this->ignore);
 
 	return "<form class='form-horizontal' action='$location' method='post'>
-		<h3 class='text-center'>Are you sure ?</h3>
-		<div class='control-group text-center'>
+		<div class='control-group'>
 		  <div class='controls'>
-		  ".($info ? "<input type='hidden' name='comm_info' value='$info'>" : "")."
-			<input type='submit' id='comm_submit' name='comm_confirm' class='btn btn-primary' value='YES'>
+		  ".($info_name ? "<input type='hidden' name='$info_name' value='$info_value'>" : "")."
+			<input type='submit' id='comm_submit' name='comm_confirm' class='btn btn-primary' value='$submit'>
 			<a href='".$_SERVER['HTTP_REFERER']."' class='btn'>Cancel</a>
 		  </div>
 		</div>
@@ -626,8 +697,10 @@ function generateReplies($comm_id, $limit = 3) {
 		if($this->hasRights($comment))
 			return "<a href='?".$this->queryString('', $this->ignore)."&comm_edit=$comment->id#$comment->id'>Edit</a> 
 				| <a href='?".$this->queryString('', $this->ignore)."&comm_del=$comment->id#$comment->id'>Delete</a>".
-				($this->settings['isAdmin'] ? 
-					" | <a href='?".$this->queryString('', $this->ignore)."&comm_ban=$comment->id#$comment->id'>Ban</a>" : "");
+				($this->settings['isAdmin'] ? //if is admin 
+					" | <a href='?".$this->queryString('', $this->ignore)."&comm_".
+					($this->isBanned($comment->ip) ? "un" : "")."ban=".urlencode($comment->ip)."'>".
+					($this->isBanned($comment->ip) ? "Un" : "")."Ban</a>" : "");
 	}
 
 
@@ -641,7 +714,7 @@ function generateReplies($comm_id, $limit = 3) {
 	function generatePages($pageid, $perpage = 10){
 
 
-		$sql = "SELECT `id` FROM `".$this->settings['table_name']."` WHERE `parent` = 0 ";
+		$sql = "SELECT `id` FROM `".$this->settings['comments_table']."` WHERE `parent` = 0 ";
 
 		if($pageid)
 			$sql .=  " AND `pageid`='".(int)$pageid."'";
@@ -677,6 +750,70 @@ function generateReplies($comm_id, $limit = 3) {
 		return $html;
 	}
 
+	/**
+	 * deletes comment based on the comment id, it also checks for the rights of the user.
+	 * @param  interger $comment_id the id of the comment to be deleted
+	 * @return boolean             true on success
+	 */
+	function delComm($comment_id) {
+		$comm = mysqli_query($this->link, "SELECT `id` FROM `".$this->settings['comments_table']."` WHERE `id` = '".(int)$comment_id."'");
+		if(mysqli_num_rows($comm) && $this->hasRights(mysqli_fetch_object($comm))) {
+			mysqli_query($this->link, "DELETE FROM `".$this->settings['comments_table']."` 
+				WHERE `id` = '".(int)$comment_id."' OR `parent` = '".(int)$comment_id."'");
+
+			return true;
+		}
+
+		return false;
+	}
+	/**
+	 * Adds the inserted ip in the banned list
+	 * @param  string $ip the ip to be banned
+	 */
+	function banIP( $ip ) {
+		if($this->settings['isAdmin'])
+			if(mysqli_query($this->link, "INSERT INTO `".$this->settings['banned_table']."` 
+				SET `ip` = '".mysqli_real_escape_string($this->link, $ip)."'"))
+				return true;
+		return false;
+	}
+
+	/**
+	 * Deletes an ip from the banned list.
+	 * @param  string $ip the ip to be unbanned
+	 */
+	function unBanIP( $ip ) {
+		if($this->settings['isAdmin']) {
+			mysqli_query($this->link, "DELETE FROM `".$this->settings['banned_table']."` 
+				WHERE `ip` = '".mysqli_real_escape_string($this->link, $ip)."'");
+			return true;
+		}
+
+		return false;
+	}
+	/**
+	 * checks if an ip is banned
+	 * @param  string $ip ip to be checked
+	 * @return boolean     true if the ip is banned
+	 */
+	function isBanned( $ip ) {
+		// no need to check the same ip 2 times in a row
+		if(count($this->checked_ips) && in_array($ip, array_keys($this->checked_ips)))
+			return $this->checked_ips[$ip];
+
+		$this->checked_ips[$ip] = $ip;
+
+
+		if(mysqli_num_rows(mysqli_query($this->link, "SELECT * FROM `".$this->settings['banned_table']."` 
+			WHERE `ip` = '".mysqli_real_escape_string($this->link, $ip)."'"))) {
+			$this->checked_ips[$ip] = true;
+			return true;
+		}
+		$this->checked_ips[$ip] = false;
+
+
+		return false;
+	}
 
 }
 
