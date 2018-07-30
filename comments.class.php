@@ -175,7 +175,7 @@ class Comments_System
 					WHERE `id`= '".(int)$_POST['comm_reply']."' AND `parent`  = '0'")))					
 					$reply = ",`parent` = '".(int)$_POST['comm_reply']."'";
 				else
-					$reply = '';
+					$reply = ",`parent` = '0'";
 
 
 
